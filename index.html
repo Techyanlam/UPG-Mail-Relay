@@ -5,55 +5,105 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>UPG 公共郵箱 — Ida Sze</title>
 <style>
-  body { font-family: -apple-system, "PingFang HK", "Microsoft JhengHei", sans-serif; margin: 0; background: #f5f5f4; color: #222; }
-  header { background: #1f3a5f; color: #fff; padding: 14px 18px; }
-  header h1 { font-size: 18px; margin: 0; }
-  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
-  main { max-width: 900px; margin: 0 auto; padding: 16px; }
-  #gate, #app { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
-  input[type=password], input[type=text] { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; }
-  button { padding: 10px 18px; font-size: 15px; border: 0; border-radius: 6px; background: #1f3a5f; color: #fff; cursor: pointer; margin-top: 10px; }
-  button.secondary { background: #e5e5e5; color: #222; }
-  .err { color: #b00020; margin-top: 10px; }
-  .meta { color: #666; font-size: 13px; margin-bottom: 12px; }
-  #list { list-style: none; padding: 0; margin: 0; }
-  #list li { border-top: 1px solid #eee; padding: 12px 4px; cursor: pointer; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang HK", "Microsoft JhengHei", sans-serif; margin: 0; background: #f5f5f4; color: #222; height: 100vh; display: flex; flex-direction: column; }
+  header { background: #1f3a5f; color: #fff; padding: 10px 18px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .addr { font-size: 13px; opacity: .85; }
+  header .spacer { flex: 1; }
+  header .sync { font-size: 12px; opacity: .85; }
+  header button { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.35); padding: 6px 12px; font-size: 13px; border-radius: 6px; cursor: pointer; margin: 0; }
+  main { flex: 1; display: grid; grid-template-columns: 190px 340px 1fr; min-height: 0; }
+  /* 左：資料夾 */
+  #folders { background: #fff; border-right: 1px solid #ddd; padding: 12px 0; overflow-y: auto; }
+  #folders h3 { font-size: 12px; color: #888; margin: 4px 16px 8px; font-weight: 600; }
+  .folder { padding: 10px 16px; cursor: pointer; font-size: 15px; display: flex; justify-content: space-between; }
+  .folder:hover { background: #f2f5f9; }
+  .folder.active { background: #e8eef5; font-weight: 600; }
+  .folder .count { color: #888; font-size: 13px; }
+  /* 中：信件列表 */
+  #listPane { background: #fff; border-right: 1px solid #ddd; display: flex; flex-direction: column; min-height: 0; }
+  #q { margin: 10px; padding: 9px 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; }
+  #list { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1; }
+  #list li { border-top: 1px solid #eee; padding: 10px 12px; cursor: pointer; }
   #list li:hover { background: #f7f9fc; }
-  #list .subj { font-weight: 600; }
-  #list .from { color: #444; font-size: 14px; }
+  #list li.selected { background: #e8eef5; }
+  #list .subj { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #list .from { color: #444; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #list .date { color: #888; font-size: 12px; }
-  #detail { white-space: pre-wrap; word-break: break-word; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 14px; margin-top: 12px; font-size: 14px; line-height: 1.6; }
-  #replyBox { margin-top: 16px; border-top: 1px solid #eee; padding-top: 12px; }
-  #replyBox textarea { width: 100%; box-sizing: border-box; min-height: 140px; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; font-family: inherit; }
-  #replyBox input[type=text] { margin-bottom: 8px; }
+  /* 右：閱讀 */
+  #reading { background: #fff; overflow-y: auto; padding: 18px 22px; min-width: 0; }
+  #reading .placeholder { color: #888; margin-top: 40px; text-align: center; }
+  #dSubj { margin: 0 0 6px; font-size: 19px; }
+  .meta { color: #666; font-size: 13px; margin: 0 0 12px; }
+  #detail { white-space: pre-wrap; word-break: break-word; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 14px; font-size: 14px; line-height: 1.6; }
+  #replyBox { margin-top: 18px; border-top: 1px solid #eee; padding-top: 12px; }
+  #replyBox h4 { margin: 0 0 6px; }
+  #replyBox textarea { width: 100%; min-height: 130px; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; font-family: inherit; }
+  #replyBox input[type=text] { width: 100%; padding: 9px 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; }
   #replyBox label { display: block; font-size: 13px; color: #666; margin: 8px 0 4px; }
   #replyStatus { margin-top: 10px; font-size: 14px; }
   #replyStatus.ok { color: #0a7a2f; }
   #replyStatus.err { color: #b00020; }
-  .tag { display: inline-block; font-size: 11px; color: #1f3a5f; background: #e8eef5; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
-  .hidden { display: none; }
+  button { padding: 10px 18px; font-size: 15px; border: 0; border-radius: 6px; background: #1f3a5f; color: #fff; cursor: pointer; margin-top: 10px; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: #e5e5e5; color: #222; }
+  /* 登入閘 */
+  #gateWrap { flex: 1; display: flex; align-items: center; justify-content: center; background: #f5f5f4; }
+  #gate { background: #fff; border-radius: 10px; padding: 24px; box-shadow: 0 1px 4px rgba(0,0,0,.08); width: 360px; max-width: 92vw; }
+  #gate input[type=password] { width: 100%; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; }
+  #gate .err { color: #b00020; margin-top: 10px; }
+  #gate .meta { margin-top: 12px; }
+  .hidden { display: none !important; }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; overflow-y: auto; }
+    #folders { display: flex; border-right: 0; border-bottom: 1px solid #ddd; padding: 6px; overflow-x: auto; }
+    #folders h3 { display: none; }
+    .folder { white-space: nowrap; }
+    #listPane { border-right: 0; }
+    #list { max-height: 45vh; }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>UPG 公共郵箱</h1>
-  <p>Ida.Sze@upg.com.hk（收信 + 回覆）</p>
+  <span class="addr">Ida.Sze@upg.com.hk</span>
+  <span class="spacer"></span>
+  <span class="sync" id="syncInfo"></span>
+  <button id="refreshBtn" class="hidden">重新整理</button>
+  <button id="logoutBtn" class="hidden">登出</button>
 </header>
-<main>
+
+<div id="gateWrap">
   <div id="gate">
     <p>請輸入閱覽密碼。</p>
     <input id="pw" type="password" placeholder="閱覽密碼" autocomplete="off">
-    <br><button id="unlock">開信箱</button>
+    <br>
+    <label style="display:block;margin-top:10px;font-size:14px;color:#444;">
+      <input id="remember" type="checkbox"> 喺呢部機記住我（下次唔使再入密碼）
+    </label>
+    <button id="unlock">開信箱</button>
     <p class="err hidden" id="gateErr"></p>
-    <p class="meta">密碼只會喺你部機上面用嚟解密；回覆嗰陣會傳去 Cloudflare Worker 驗證身份，唔會存起。</p>
+    <p class="meta">密碼只會喺你部機上面用嚟解密；回覆嗰陣會傳去 Cloudflare Worker 驗證身份，唔會存起。「記住我」會將密碼存喺呢部瀏覽器，唔好喺公用電腦上面剔。</p>
   </div>
+</div>
 
-  <div id="app" class="hidden">
-    <p class="meta" id="syncInfo"></p>
+<main id="app" class="hidden">
+  <nav id="folders">
+    <h3>資料夾</h3>
+    <div class="folder active" data-folder="INBOX">收件箱 <span class="count" id="countInbox"></span></div>
+    <div class="folder" data-folder="SENT">寄件 <span class="count" id="countSent"></span></div>
+  </nav>
+
+  <section id="listPane">
     <input id="q" type="text" placeholder="搜尋寄件人 / 主旨…">
     <ul id="list"></ul>
+  </section>
+
+  <section id="reading">
+    <div id="emptyMsg" class="placeholder">揀一封信嚟睇</div>
     <div id="detailWrap" class="hidden">
-      <button class="secondary" id="back">← 返回列表</button>
       <h3 id="dSubj"></h3>
       <p class="meta" id="dMeta"></p>
       <div id="detail"></div>
@@ -69,15 +119,17 @@
         <p id="replyStatus"></p>
       </div>
     </div>
-    <button class="secondary" id="refresh">重新整理</button>
-  </div>
+  </section>
 </main>
+
 <script>
 const REPLY_API = "https://upg-mail-relay-send.yan-lam.workers.dev/send";
+const STORE_KEY = "upg-mail-pw";
 let MESSAGES = [];
 let KEY = null;
 let PW = null;
 let CURRENT = null;
+let ACTIVE_FOLDER = "INBOX";
 
 function b64ToBuf(b64) {
   const bin = atob(b64);
@@ -90,73 +142,124 @@ function fmtDate(iso) {
   const d = new Date(iso);
   return d.toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
-async function unlock() {
-  const pw = document.getElementById("pw").value;
+function isSent(m) { return m.folder && m.folder !== "INBOX"; }
+
+async function loadMail(pw) {
+  const res = await fetch("mail.enc.json", { cache: "no-store" });
+  if (!res.ok) throw new Error("未有信件資料（mail.enc.json 唔存在），請稍後再試。");
+  const enc = await res.json();
+  const salt = b64ToBuf(enc.salt), nonce = b64ToBuf(enc.nonce), data = b64ToBuf(enc.data);
+  const baseKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" },
+    baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, data);
+  const payload = JSON.parse(new TextDecoder().decode(plain));
+  return { payload, key };
+}
+
+async function unlock(pw, remember) {
   const err = document.getElementById("gateErr");
   err.classList.add("hidden");
-  if (!pw) { err.textContent = "請輸入密碼。"; err.classList.remove("hidden"); return; }
   try {
-    const res = await fetch("mail.enc.json", { cache: "no-store" });
-    if (!res.ok) throw new Error("未有信件資料（mail.enc.json 唔存在），請稍後再試。");
-    const enc = await res.json();
-    const salt = b64ToBuf(enc.salt), nonce = b64ToBuf(enc.nonce), data = b64ToBuf(enc.data);
-    const baseKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
-    KEY = await crypto.subtle.deriveKey(
-      { name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" },
-      baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, KEY, data);
-    const payload = JSON.parse(new TextDecoder().decode(plain));
-    MESSAGES = payload.messages || [];
+    const { payload, key } = await loadMail(pw);
+    KEY = key;
     PW = pw;
+    MESSAGES = payload.messages || [];
+    if (remember) {
+      localStorage.setItem(STORE_KEY, pw);
+      sessionStorage.removeItem(STORE_KEY);
+    } else {
+      sessionStorage.setItem(STORE_KEY, pw);
+      localStorage.removeItem(STORE_KEY);
+    }
     document.getElementById("syncInfo").textContent =
-      "共 " + payload.count + " 封（最新 " + MESSAGES.length + " 封）・最後同步：" + fmtDate(payload.synced_at);
-    document.getElementById("gate").classList.add("hidden");
+      "共 " + payload.count + " 封・最後同步：" + fmtDate(payload.synced_at);
+    document.getElementById("gateWrap").classList.add("hidden");
     document.getElementById("app").classList.remove("hidden");
+    document.getElementById("refreshBtn").classList.remove("hidden");
+    document.getElementById("logoutBtn").classList.remove("hidden");
+    updateCounts();
     renderList("");
+    return true;
   } catch (e) {
-    err.textContent = (e && e.name === "OperationError") ? "密碼唔啱，請再試。" : ("開唔到：" + (e.message || e));
+    if (e && e.name === "OperationError") {
+      err.textContent = "密碼唔啱，請再試。";
+    } else {
+      err.textContent = "開唔到：" + (e.message || e);
+    }
     err.classList.remove("hidden");
+    return false;
   }
 }
+
+async function refresh() {
+  if (!PW) return;
+  try {
+    const { payload } = await loadMail(PW);
+    MESSAGES = payload.messages || [];
+    document.getElementById("syncInfo").textContent =
+      "共 " + payload.count + " 封・最後同步：" + fmtDate(payload.synced_at);
+    updateCounts();
+    renderList(document.getElementById("q").value);
+  } catch (e) {
+    // 密碼可能改咗：清掉記住嘅密碼，返去登入版。
+    localStorage.removeItem(STORE_KEY);
+    sessionStorage.removeItem(STORE_KEY);
+    location.reload();
+  }
+}
+
+function updateCounts() {
+  const inbox = MESSAGES.filter(m => !isSent(m)).length;
+  const sent = MESSAGES.filter(m => isSent(m)).length;
+  document.getElementById("countInbox").textContent = inbox || "";
+  document.getElementById("countSent").textContent = sent || "";
+}
+
 function renderList(q) {
   const needle = (q || "").toLowerCase();
   const list = document.getElementById("list");
   list.innerHTML = "";
-  document.getElementById("detailWrap").classList.add("hidden");
-  const shown = MESSAGES.filter(m =>
-    !needle || (m.subject + " " + m.from).toLowerCase().includes(needle));
-  if (!shown.length) { list.innerHTML = "<li>搵唔到符合嘅信。</li>"; return; }
+  const shown = MESSAGES.filter(m => {
+    const inFolder = ACTIVE_FOLDER === "SENT" ? isSent(m) : !isSent(m);
+    if (!inFolder) return false;
+    return !needle || ((m.subject || "") + " " + (m.from || "")).toLowerCase().includes(needle);
+  });
+  if (!shown.length) { list.innerHTML = "<li>呢個資料夾冇信。</li>"; return; }
   shown.forEach(m => {
     const li = document.createElement("li");
+    if (CURRENT && m === CURRENT) li.classList.add("selected");
     const subj = document.createElement("div"); subj.className = "subj"; subj.textContent = m.subject || "(冇主旨)";
-    if (m.folder && m.folder !== "INBOX") {
-      const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = "寄件";
-      subj.appendChild(tag);
-    }
     const from = document.createElement("div"); from.className = "from"; from.textContent = m.from || "";
     const date = document.createElement("div"); date.className = "date"; date.textContent = fmtDate(m.date);
     li.append(subj, from, date);
-    li.onclick = () => {
-      CURRENT = m;
-      document.getElementById("dSubj").textContent = m.subject || "(冇主旨)";
-      document.getElementById("dMeta").textContent = "寄件人：" + (m.from || "") + "　時間：" + fmtDate(m.date) +
-        (m.attachments && m.attachments.length ? "　附件：" + m.attachments.join("、") : "");
-      document.getElementById("detail").textContent = m.body || "(冇內文)";
-      const isSent = m.folder && m.folder !== "INBOX";
-      document.getElementById("replyBox").classList.toggle("hidden", !!isSent);
-      if (!isSent) {
-        document.getElementById("rTo").value = extractEmail(m.from);
-        document.getElementById("rSubj").value = /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
-        document.getElementById("rBody").value = "";
-        document.getElementById("replyStatus").textContent = "";
-        document.getElementById("replyStatus").className = "";
-      }
-      document.getElementById("detailWrap").classList.remove("hidden");
-      document.getElementById("detailWrap").scrollIntoView();
-    };
+    li.onclick = () => openMail(m, li);
     list.appendChild(li);
   });
 }
+
+function openMail(m, li) {
+  CURRENT = m;
+  document.querySelectorAll("#list li").forEach(el => el.classList.remove("selected"));
+  if (li) li.classList.add("selected");
+  document.getElementById("emptyMsg").classList.add("hidden");
+  document.getElementById("dSubj").textContent = m.subject || "(冇主旨)";
+  document.getElementById("dMeta").textContent = "寄件人：" + (m.from || "") + "　時間：" + fmtDate(m.date) +
+    (m.attachments && m.attachments.length ? "　附件：" + m.attachments.join("、") : "");
+  document.getElementById("detail").textContent = m.body || "(冇內文)";
+  const sent = isSent(m);
+  document.getElementById("replyBox").classList.toggle("hidden", sent);
+  if (!sent) {
+    document.getElementById("rTo").value = extractEmail(m.from);
+    document.getElementById("rSubj").value = /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
+    document.getElementById("rBody").value = "";
+    document.getElementById("replyStatus").textContent = "";
+    document.getElementById("replyStatus").className = "";
+  }
+  document.getElementById("detailWrap").classList.remove("hidden");
+}
+
 function extractEmail(from) {
   if (!from) return "";
   const m = from.match(/<([^<>]+)>/);
@@ -164,6 +267,7 @@ function extractEmail(from) {
   const bare = from.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
   return bare ? bare[0] : from.trim();
 }
+
 async function sendReply() {
   const status = document.getElementById("replyStatus");
   const btn = document.getElementById("sendReply");
@@ -204,11 +308,51 @@ async function sendReply() {
   }
   btn.disabled = false;
 }
-document.getElementById("sendReply").onclick = sendReply;
-document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") unlock(); });
+
+function logout() {
+  localStorage.removeItem(STORE_KEY);
+  sessionStorage.removeItem(STORE_KEY);
+  location.reload();
+}
+
+document.getElementById("unlock").onclick = async () => {
+  const pw = document.getElementById("pw").value;
+  if (!pw) {
+    const err = document.getElementById("gateErr");
+    err.textContent = "請輸入密碼。";
+    err.classList.remove("hidden");
+    return;
+  }
+  await unlock(pw, document.getElementById("remember").checked);
+};
+document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("unlock").click(); });
 document.getElementById("q").addEventListener("input", e => renderList(e.target.value));
-document.getElementById("back").onclick = () => document.getElementById("detailWrap").classList.add("hidden");
-document.getElementById("refresh").onclick = () => location.reload();
+document.getElementById("refreshBtn").onclick = refresh;
+document.getElementById("logoutBtn").onclick = logout;
+document.getElementById("sendReply").onclick = sendReply;
+document.querySelectorAll(".folder").forEach(el => {
+  el.onclick = () => {
+    ACTIVE_FOLDER = el.dataset.folder;
+    document.querySelectorAll(".folder").forEach(f => f.classList.remove("active"));
+    el.classList.add("active");
+    CURRENT = null;
+    document.getElementById("detailWrap").classList.add("hidden");
+    document.getElementById("emptyMsg").classList.remove("hidden");
+    renderList(document.getElementById("q").value);
+  };
+});
+
+// 開頁自動用記住咗嘅密碼登入；唔得就留喺登入版。
+(async () => {
+  const saved = localStorage.getItem(STORE_KEY) || sessionStorage.getItem(STORE_KEY);
+  if (saved) {
+    const ok = await unlock(saved, !!localStorage.getItem(STORE_KEY));
+    if (!ok) {
+      localStorage.removeItem(STORE_KEY);
+      sessionStorage.removeItem(STORE_KEY);
+    }
+  }
+})();
 </script>
 </body>
 </html>
