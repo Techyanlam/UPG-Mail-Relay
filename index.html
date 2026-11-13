@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UPG 公共郵箱 — Ida Sze</title>
+<style>
+  body { font-family: -apple-system, "PingFang HK", "Microsoft JhengHei", sans-serif; margin: 0; background: #f5f5f4; color: #222; }
+  header { background: #1f3a5f; color: #fff; padding: 14px 18px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; }
+  #gate, #app { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  input[type=password], input[type=text] { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; }
+  button { padding: 10px 18px; font-size: 15px; border: 0; border-radius: 6px; background: #1f3a5f; color: #fff; cursor: pointer; margin-top: 10px; }
+  button.secondary { background: #e5e5e5; color: #222; }
+  .err { color: #b00020; margin-top: 10px; }
+  .meta { color: #666; font-size: 13px; margin-bottom: 12px; }
+  #list { list-style: none; padding: 0; margin: 0; }
+  #list li { border-top: 1px solid #eee; padding: 12px 4px; cursor: pointer; }
+  #list li:hover { background: #f7f9fc; }
+  #list .subj { font-weight: 600; }
+  #list .from { color: #444; font-size: 14px; }
+  #list .date { color: #888; font-size: 12px; }
+  #detail { white-space: pre-wrap; word-break: break-word; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 14px; margin-top: 12px; font-size: 14px; line-height: 1.6; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>UPG 公共郵箱</h1>
+  <p>Ida.Sze@upg.com.hk（唯讀中轉）</p>
+</header>
+<main>
+  <div id="gate">
+    <p>請輸入閱覽密碼。</p>
+    <input id="pw" type="password" placeholder="閱覽密碼" autocomplete="off">
+    <br><button id="unlock">開信箱</button>
+    <p class="err hidden" id="gateErr"></p>
+    <p class="meta">密碼只會喺你部機上面用嚟解密，唔會傳送去任何地方。</p>
+  </div>
+
+  <div id="app" class="hidden">
+    <p class="meta" id="syncInfo"></p>
+    <input id="q" type="text" placeholder="搜尋寄件人 / 主旨…">
+    <ul id="list"></ul>
+    <div id="detailWrap" class="hidden">
+      <button class="secondary" id="back">← 返回列表</button>
+      <h3 id="dSubj"></h3>
+      <p class="meta" id="dMeta"></p>
+      <div id="detail"></div>
+    </div>
+    <button class="secondary" id="refresh">重新整理</button>
+  </div>
+</main>
+<script>
+let MESSAGES = [];
+let KEY = null;
+
+function b64ToBuf(b64) {
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf;
+}
+function fmtDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+async function unlock() {
+  const pw = document.getElementById("pw").value;
+  const err = document.getElementById("gateErr");
+  err.classList.add("hidden");
+  if (!pw) { err.textContent = "請輸入密碼。"; err.classList.remove("hidden"); return; }
+  try {
+    const res = await fetch("mail.enc.json", { cache: "no-store" });
+    if (!res.ok) throw new Error("未有信件資料（mail.enc.json 唔存在），請稍後再試。");
+    const enc = await res.json();
+    const salt = b64ToBuf(enc.salt), nonce = b64ToBuf(enc.nonce), data = b64ToBuf(enc.data);
+    const baseKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+    KEY = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" },
+      baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, KEY, data);
+    const payload = JSON.parse(new TextDecoder().decode(plain));
+    MESSAGES = payload.messages || [];
+    document.getElementById("syncInfo").textContent =
+      "共 " + payload.count + " 封（最新 " + MESSAGES.length + " 封）・最後同步：" + fmtDate(payload.synced_at);
+    document.getElementById("gate").classList.add("hidden");
+    document.getElementById("app").classList.remove("hidden");
+    renderList("");
+  } catch (e) {
+    err.textContent = (e && e.name === "OperationError") ? "密碼唔啱，請再試。" : ("開唔到：" + (e.message || e));
+    err.classList.remove("hidden");
+  }
+}
+function renderList(q) {
+  const needle = (q || "").toLowerCase();
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  document.getElementById("detailWrap").classList.add("hidden");
+  const shown = MESSAGES.filter(m =>
+    !needle || (m.subject + " " + m.from).toLowerCase().includes(needle));
+  if (!shown.length) { list.innerHTML = "<li>搵唔到符合嘅信。</li>"; return; }
+  shown.forEach(m => {
+    const li = document.createElement("li");
+    const subj = document.createElement("div"); subj.className = "subj"; subj.textContent = m.subject || "(冇主旨)";
+    const from = document.createElement("div"); from.className = "from"; from.textContent = m.from || "";
+    const date = document.createElement("div"); date.className = "date"; date.textContent = fmtDate(m.date);
+    li.append(subj, from, date);
+    li.onclick = () => {
+      document.getElementById("dSubj").textContent = m.subject || "(冇主旨)";
+      document.getElementById("dMeta").textContent = "寄件人：" + (m.from || "") + "　時間：" + fmtDate(m.date) +
+        (m.attachments && m.attachments.length ? "　附件：" + m.attachments.join("、") : "");
+      document.getElementById("detail").textContent = m.body || "(冇內文)";
+      document.getElementById("detailWrap").classList.remove("hidden");
+      document.getElementById("detailWrap").scrollIntoView();
+    };
+    list.appendChild(li);
+  });
+}
+document.getElementById("unlock").onclick = unlock;
+document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") unlock(); });
+document.getElementById("q").addEventListener("input", e => renderList(e.target.value));
+document.getElementById("back").onclick = () => document.getElementById("detailWrap").classList.add("hidden");
+document.getElementById("refresh").onclick = () => location.reload();
+</script>
+</body>
+</html>
