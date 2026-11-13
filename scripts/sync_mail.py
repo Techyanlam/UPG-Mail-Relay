@@ -16,10 +16,12 @@ Nothing secret is printed. Only counts and folder names are logged.
 
 Speed notes: a run reuses the previous encrypted snapshot — messages whose
 UID and size are unchanged are copied over without re-fetching, so a normal
-run only fetches the few new mails. New small messages are fetched in one
-batch call; if the server drops the connection mid-batch (``socket error:
-EOF``, usually one very large message), it falls back to fetching them one
-by one on fresh connections. Big messages are headers-only.
+run only fetches the few new mails. New messages are fetched in parallel
+(4 workers, chunks of 5 on separate connections); if the server drops a
+chunk mid-fetch (``socket error: EOF``, usually one very large message),
+that chunk falls back to one-by-one on fresh connections. Socket timeout
+is 30s and a single message gets 2 attempts, so one bad message cannot
+stall the whole run. Big messages are headers-only.
 
 All IMAP commands use UID variants (UID SEARCH / UID FETCH) so message
 identities stay stable even if a mail is deleted from the mailbox.
@@ -32,6 +34,7 @@ import quopri
 import re
 import ssl
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -262,7 +265,7 @@ def placeholder(uid, folder, size):
 def connect(host, port, user, password, folder="INBOX"):
     mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
     try:
-        mail.sock.settimeout(120)
+        mail.sock.settimeout(30)
     except Exception:
         pass
     mail.login(user, password)
@@ -326,7 +329,7 @@ def fetch_one(host, port, user, password, folder, uid, size, max_fetch):
     """Fetch a single message on a fresh connection, with retries.
     Returns a record; never raises for one bad message."""
     big = size > max_fetch
-    for attempt in range(3):
+    for attempt in range(2):
         mail = None
         try:
             mail = connect(host, port, user, password, folder)
@@ -339,7 +342,7 @@ def fetch_one(host, port, user, password, folder, uid, size, max_fetch):
             return parse_msg(raw, uid, folder, size)
         except Exception as e:
             print(f"[{folder}] uid {uid} attempt {attempt + 1} failed: {type(e).__name__}")
-            if attempt == 2:
+            if attempt == 1:
                 try:
                     mail2 = connect(host, port, user, password, folder)
                     try:
@@ -355,6 +358,29 @@ def fetch_one(host, port, user, password, folder, uid, size, max_fetch):
             if mail is not None:
                 close(mail)
     return placeholder(uid, folder, size)
+
+
+def fetch_chunk(host, port, user, password, folder, chunk, size_map, max_fetch):
+    """Fetch one small chunk (a few UIDs) on its own connection.
+    Tries one batch fetch; on any failure falls back to one-by-one.
+    Returns a list of records; never raises."""
+    uids = [uid for uid, _ in chunk]
+    mail = None
+    try:
+        mail = connect(host, port, user, password, folder)
+        status, data = mail.uid("fetch", ",".join(uids), "(RFC822)")
+        if status == "OK" and data:
+            got = parse_batch_fetch(data, uids)
+            if got is not None:
+                return [parse_msg(got[uid], uid, folder, size_map[uid]) for uid in uids]
+            print(f"[{folder}] chunk fetch UID mismatch, falling back")
+    except Exception as e:
+        print(f"[{folder}] chunk fetch failed ({type(e).__name__}), falling back")
+    finally:
+        if mail is not None:
+            close(mail)
+    return [fetch_one(host, port, user, password, folder, uid, size_map[uid], max_fetch)
+            for uid in uids]
 
 
 def sync_folder(host, port, user, password, folder, max_messages, max_fetch, prev):
@@ -403,57 +429,26 @@ def sync_folder(host, port, user, password, folder, max_messages, max_fetch, pre
         else:
             to_fetch.append((uid, size))
 
-    # Fetch new messages in small batches (10 per call) over one shared
-    # connection. A single 100-message fetch gets cut off by the server
-    # (socket EOF), and fetching one-by-one with a fresh login each time
-    # takes minutes; 10-at-a-time is the middle ground. A failed chunk
-    # falls back to one-by-one for that chunk only.
+    # Fetch new messages in parallel: 4 workers, each taking a chunk of 5
+    # on its own connection. One shared connection + sequential fallback
+    # was the bottleneck — every stalled fetch blocked everything behind
+    # it, and a fresh login per message costs seconds. Smaller chunks are
+    # also less likely to be cut off by the server. A failed chunk falls
+    # back to one-by-one for that chunk only; a chunk that fails outright
+    # still returns placeholders so the snapshot completes.
     if to_fetch:
         size_map = dict(to_fetch)
-        chunk_size = 10
-        try:
-            mail = connect(host, port, user, password, folder)
-        except Exception as e:
-            print(f"[{folder}] connect failed ({type(e).__name__}), fetching one-by-one")
-            mail = None
-        if mail is None:
-            for uid, size in to_fetch:
-                messages.append(fetch_one(host, port, user, password, folder, uid, size, max_fetch))
-        else:
-            try:
-                i = 0
-                while i < len(to_fetch):
-                    chunk = [uid for uid, _ in to_fetch[i:i + chunk_size]]
-                    got = None
-                    try:
-                        status, data = mail.uid("fetch", ",".join(chunk), "(RFC822)")
-                        if status == "OK" and data:
-                            got = parse_batch_fetch(data, chunk)
-                            if got is None:
-                                print(f"[{folder}] chunk fetch UID mismatch, falling back")
-                    except Exception as e:
-                        print(f"[{folder}] chunk fetch failed ({type(e).__name__}), falling back")
-                        got = None
-                        close(mail)
-                        mail = None
-                    if got is not None:
-                        for uid in chunk:
-                            messages.append(parse_msg(got[uid], uid, folder, size_map[uid]))
-                    else:
-                        for uid in chunk:
-                            messages.append(fetch_one(host, port, user, password, folder, uid, size_map[uid], max_fetch))
-                    i += chunk_size
-                    if mail is None and i < len(to_fetch):
-                        try:
-                            mail = connect(host, port, user, password, folder)
-                        except Exception as e:
-                            print(f"[{folder}] reconnect failed ({type(e).__name__}), remaining one-by-one")
-                            for uid, size in to_fetch[i:]:
-                                messages.append(fetch_one(host, port, user, password, folder, uid, size, max_fetch))
-                            break
-            finally:
-                if mail is not None:
-                    close(mail)
+        chunk_size = 5
+        chunks = [to_fetch[i:i + chunk_size] for i in range(0, len(to_fetch), chunk_size)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(fetch_chunk, host, port, user, password,
+                                   folder, chunk, size_map, max_fetch)
+                       for chunk in chunks]
+            for fut in futures:
+                try:
+                    messages.extend(fut.result())
+                except Exception as e:
+                    print(f"[{folder}] chunk worker failed ({type(e).__name__}), skipping")
 
     return messages, skipped
 
