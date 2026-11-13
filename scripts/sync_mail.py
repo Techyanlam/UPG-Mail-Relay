@@ -14,11 +14,15 @@ Secrets come only from the environment (GitHub Actions secrets):
 
 Nothing secret is printed. Only counts and folder names are logged.
 
-Resilience notes: the Feishu IMAP server sometimes closes the connection
-mid-fetch (``socket error: EOF``), usually on a very large message. So we
-check RFC822.SIZE first, fetch big messages as headers-only, and retry
-each normal fetch on a fresh connection instead of letting one bad
-message abort the whole sync.
+Speed notes: a run reuses the previous encrypted snapshot — messages whose
+UID and size are unchanged are copied over without re-fetching, so a normal
+run only fetches the few new mails. New small messages are fetched in one
+batch call; if the server drops the connection mid-batch (``socket error:
+EOF``, usually one very large message), it falls back to fetching them one
+by one on fresh connections. Big messages are headers-only.
+
+All IMAP commands use UID variants (UID SEARCH / UID FETCH) so message
+identities stay stable even if a mail is deleted from the mailbox.
 """
 import base64
 import email
@@ -39,6 +43,40 @@ MAX_BODY = 20000
 
 def b64(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
+
+
+def b64decode(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"))
+
+
+def derive_key(view_key, salt):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200000
+    )
+    return kdf.derive(view_key.encode("utf-8"))
+
+
+def load_previous_snapshot(view_key, path):
+    """Decrypt the previous mail.enc.json (if any) for incremental reuse.
+    Returns {(folder, uid): record} or {} on any failure."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            enc = json.load(f)
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        key = derive_key(view_key, b64decode(enc["salt"]))
+        plain = AESGCM(key).decrypt(b64decode(enc["nonce"]), b64decode(enc["data"]), None)
+        payload = json.loads(plain.decode("utf-8"))
+        out = {}
+        for m in payload.get("messages") or []:
+            out[(m.get("folder", "INBOX"), str(m.get("uid")))] = m
+        return out
+    except Exception as e:
+        print(f"no usable previous snapshot ({type(e).__name__}), full fetch")
+        return {}
 
 
 _ENCODED_WORD = re.compile(r"=\?([^?\s]+)\?([bBqQ])\?([^?]*)\?=")
@@ -156,7 +194,7 @@ def thread_fields(msg):
     }
 
 
-def parse_msg(raw, uid, folder):
+def parse_msg(raw, uid, folder, size):
     msg = email.message_from_bytes(raw)
     try:
         dt = parsedate_to_datetime(msg.get("Date") or "")
@@ -167,6 +205,7 @@ def parse_msg(raw, uid, folder):
     rec = {
         "uid": uid,
         "folder": folder,
+        "size": size,
         "date": date_iso,
         "from": decode_str(msg.get("From")),
         "to": decode_str(msg.get("To")),
@@ -179,7 +218,7 @@ def parse_msg(raw, uid, folder):
     return rec
 
 
-def parse_header(raw, uid, folder, note=""):
+def parse_header(raw, uid, folder, size, note=""):
     msg = email.message_from_bytes(raw)
     try:
         dt = parsedate_to_datetime(msg.get("Date") or "")
@@ -189,6 +228,7 @@ def parse_header(raw, uid, folder, note=""):
     rec = {
         "uid": uid,
         "folder": folder,
+        "size": size,
         "date": date_iso,
         "from": decode_str(msg.get("From")),
         "to": decode_str(msg.get("To")),
@@ -199,6 +239,24 @@ def parse_header(raw, uid, folder, note=""):
     }
     rec.update(thread_fields(msg))
     return rec
+
+
+def placeholder(uid, folder, size):
+    return {
+        "uid": uid,
+        "folder": folder,
+        "size": size,
+        "date": "",
+        "from": "",
+        "to": "",
+        "subject": "（未能同步此封信）",
+        "attachments": [],
+        "body": "",
+        "body_html": "",
+        "message_id": "",
+        "in_reply_to": "",
+        "references": "",
+    }
 
 
 def connect(host, port, user, password, folder="INBOX"):
@@ -223,8 +281,8 @@ def close(mail):
         pass
 
 
-def fetch_raw(mail, uid, what):
-    status, data = mail.fetch(uid, what)
+def uid_fetch_raw(mail, uid, what):
+    status, data = mail.uid("fetch", uid, what)
     if status != "OK" or not data:
         raise imaplib.IMAP4.error(f"fetch {what} failed for {uid}")
     for item in data:
@@ -233,11 +291,47 @@ def fetch_raw(mail, uid, what):
     raise imaplib.IMAP4.error(f"fetch {what} returned no bytes for {uid}")
 
 
-def sync_folder(host, port, user, password, folder, max_messages, max_fetch):
-    """Fetch the newest messages from one folder. Returns (records, skipped)."""
+def fetch_one(host, port, user, password, folder, uid, size, max_fetch):
+    """Fetch a single message on a fresh connection, with retries.
+    Returns a record; never raises for one bad message."""
+    big = size > max_fetch
+    for attempt in range(3):
+        mail = None
+        try:
+            mail = connect(host, port, user, password, folder)
+            if big:
+                raw = uid_fetch_raw(mail, uid, "(BODY.PEEK[HEADER])")
+                return parse_header(
+                    raw, uid, folder, size, "（呢封信附件較大，未同步內文，請喺 Lark 睇原文。）"
+                )
+            raw = uid_fetch_raw(mail, uid, "(RFC822)")
+            return parse_msg(raw, uid, folder, size)
+        except Exception as e:
+            print(f"[{folder}] uid {uid} attempt {attempt + 1} failed: {type(e).__name__}")
+            if attempt == 2:
+                try:
+                    mail2 = connect(host, port, user, password, folder)
+                    try:
+                        raw = uid_fetch_raw(mail2, uid, "(BODY.PEEK[HEADER])")
+                        return parse_header(
+                            raw, uid, folder, size, "（呢封信同步時連線中斷，未同步內文。）"
+                        )
+                    finally:
+                        close(mail2)
+                except Exception:
+                    return placeholder(uid, folder, size)
+        finally:
+            if mail is not None:
+                close(mail)
+    return placeholder(uid, folder, size)
+
+
+def sync_folder(host, port, user, password, folder, max_messages, max_fetch, prev):
+    """Fetch the newest messages from one folder.
+    Unchanged messages are reused from the previous snapshot."""
     mail = connect(host, port, user, password, folder)
     try:
-        status, data = mail.search(None, "ALL")
+        status, data = mail.uid("search", None, "ALL")
         if status != "OK":
             print(f"[{folder}] IMAP search failed", file=sys.stderr)
             return [], 0
@@ -249,7 +343,7 @@ def sync_folder(host, port, user, password, folder, max_messages, max_fetch):
         sizes = {}
         if uids:
             try:
-                status, data = mail.fetch(",".join(uids), "(UID RFC822.SIZE)")
+                status, data = mail.uid("fetch", ",".join(uids), "(UID RFC822.SIZE)")
                 if status == "OK":
                     parts = []
                     for item in data:
@@ -267,62 +361,49 @@ def sync_folder(host, port, user, password, folder, max_messages, max_fetch):
 
     messages = []
     skipped = 0
+    to_fetch = []
     for uid in reversed(uids):  # newest first
         size = sizes.get(uid, 0)
-        big = size > max_fetch
-        record = None
-        # Fresh connection per message: if the server drops us mid-fetch,
-        # only this message is affected, never the whole sync.
-        for attempt in range(3):
-            mail = None
-            try:
-                mail = connect(host, port, user, password, folder)
-                if big:
-                    raw = fetch_raw(mail, uid, "(BODY.PEEK[HEADER])")
-                    record = parse_header(
-                        raw, uid, folder, "（呢封信附件較大，未同步內文，請喺 Lark 睇原文。）"
-                    )
+        old = prev.get((folder, uid))
+        if old is not None and old.get("size", -1) == size and size > 0:
+            messages.append(old)
+        elif size > max_fetch:
+            messages.append(fetch_one(host, port, user, password, folder, uid, size, max_fetch))
+        else:
+            to_fetch.append((uid, size))
+
+    # Batch-fetch all new small messages in one call; fall back to
+    # one-by-one if the server drops the connection mid-batch.
+    if to_fetch:
+        batch_ok = False
+        mail = None
+        try:
+            mail = connect(host, port, user, password, folder)
+            uid_set = ",".join(uid for uid, _ in to_fetch)
+            status, data = mail.uid("fetch", uid_set, "(RFC822)")
+            if status == "OK" and data:
+                got = {}
+                for item in data:
+                    if isinstance(item, tuple) and isinstance(item[1], bytes):
+                        m = re.search(rb"(\d+) \(RFC822", item[0])
+                        if m:
+                            got[m.group(1).decode("ascii")] = item[1]
+                if len(got) == len(to_fetch):
+                    size_map = dict(to_fetch)
+                    for uid, _ in to_fetch:
+                        messages.append(parse_msg(got[uid], uid, folder, size_map[uid]))
+                    batch_ok = True
                 else:
-                    raw = fetch_raw(mail, uid, "(RFC822)")
-                    record = parse_msg(raw, uid, folder)
-                break
-            except Exception as e:
-                print(f"[{folder}] uid {uid} attempt {attempt + 1} failed: {type(e).__name__}")
-                record = None
-                if attempt == 2:
-                    # Last resort: header only, so the message still shows
-                    # in the list instead of killing the sync.
-                    try:
-                        mail2 = connect(host, port, user, password, folder)
-                        try:
-                            raw = fetch_raw(mail2, uid, "(BODY.PEEK[HEADER])")
-                            record = parse_header(
-                                raw, uid, folder, "（呢封信同步時連線中斷，未同步內文。）"
-                            )
-                        finally:
-                            close(mail2)
-                    except Exception:
-                        record = {
-                            "uid": uid,
-                            "folder": folder,
-                            "date": "",
-                            "from": "",
-                            "to": "",
-                            "subject": "（未能同步此封信）",
-                            "attachments": [],
-                            "body": "",
-                            "body_html": "",
-                            "message_id": "",
-                            "in_reply_to": "",
-                            "references": "",
-                        }
-            finally:
-                if mail is not None:
-                    close(mail)
-        if record is None:
-            skipped += 1
-            continue
-        messages.append(record)
+                    print(f"[{folder}] batch fetch returned {len(got)}/{len(to_fetch)}, falling back")
+        except Exception as e:
+            print(f"[{folder}] batch fetch failed ({type(e).__name__}), falling back")
+        finally:
+            if mail is not None:
+                close(mail)
+        if not batch_ok:
+            for uid, size in to_fetch:
+                messages.append(fetch_one(host, port, user, password, folder, uid, size, max_fetch))
+
     return messages, skipped
 
 
@@ -372,13 +453,16 @@ def main():
         print("IMAP_PASSWORD and MAIL_VIEW_KEY are required", file=sys.stderr)
         return 2
 
-    inbox, skipped_inbox = sync_folder(host, port, user, password, "INBOX", max_messages, max_fetch)
+    out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mail.enc.json")
+    prev = load_previous_snapshot(view_key, out_path)
+
+    inbox, skipped_inbox = sync_folder(host, port, user, password, "INBOX", max_messages, max_fetch, prev)
     messages = inbox
     skipped = skipped_inbox
 
     sent_folder = find_sent_folder(host, port, user, password)
     if sent_folder:
-        sent, skipped_sent = sync_folder(host, port, user, password, sent_folder, max_sent, max_fetch)
+        sent, skipped_sent = sync_folder(host, port, user, password, sent_folder, max_sent, max_fetch, prev)
         messages = messages + sent
         skipped += skipped_sent
         print(f"synced Sent folder '{sent_folder}': {len(sent)} messages")
@@ -398,16 +482,11 @@ def main():
 
     # AES-GCM, key from PBKDF2-HMAC-SHA256(passphrase, salt, 200k).
     # WebCrypto on the viewer side derives the identical key.
-    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
     salt = os.urandom(16)
     nonce = os.urandom(12)
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200000
-    )
-    key = kdf.derive(view_key.encode("utf-8"))
+    key = derive_key(view_key, salt)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
 
     out = {
@@ -417,7 +496,6 @@ def main():
         "nonce": b64(nonce),
         "data": b64(ciphertext),
     }
-    out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mail.enc.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f)
     print(f"synced {len(messages)} messages ({skipped} skipped) -> mail.enc.json")
