@@ -112,6 +112,9 @@
         <h4>回覆（以 Ida.Sze@upg.com.hk 寄出）</h4>
         <label>收件人</label>
         <input id="rTo" type="text" readonly>
+        <label><input id="rAll" type="checkbox"> 回覆全部（連同原信其他收件人）</label>
+        <label id="rCcLabel" class="hidden">副本</label>
+        <input id="rCc" type="text" class="hidden">
         <label>主旨</label>
         <input id="rSubj" type="text">
         <label>回覆內容</label>
@@ -271,6 +274,10 @@ function openMail(m, li) {
   document.getElementById("replyBox").classList.toggle("hidden", sent);
   if (!sent) {
     document.getElementById("rTo").value = extractEmail(m.from);
+    document.getElementById("rAll").checked = false;
+    document.getElementById("rCcLabel").classList.add("hidden");
+    document.getElementById("rCc").classList.add("hidden");
+    document.getElementById("rCc").value = replyAllCc(m);
     document.getElementById("rSubj").value = /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
     document.getElementById("rBody").value = "";
     document.getElementById("replyStatus").textContent = "";
@@ -287,6 +294,29 @@ function extractEmail(from) {
   return bare ? bare[0] : from.trim();
 }
 
+function allEmails(s) {
+  return (s || "").match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [];
+}
+
+// Reply-all CC: everyone on the original To/Cc, except Ida herself and
+// the sender (who is already the To). Old snapshots have no Cc field,
+// so those mails fall back to the To list only.
+function replyAllCc(m) {
+  const seen = new Set(["ida.sze@upg.com.hk", extractEmail(m.from).toLowerCase()]);
+  const out = [];
+  for (const addr of [...allEmails(m.to), ...allEmails(m.cc)]) {
+    const a = addr.toLowerCase();
+    if (!seen.has(a)) { seen.add(a); out.push(addr); }
+  }
+  return out.join(", ");
+}
+
+document.getElementById("rAll").onchange = (e) => {
+  const on = e.target.checked;
+  document.getElementById("rCcLabel").classList.toggle("hidden", !on);
+  document.getElementById("rCc").classList.toggle("hidden", !on);
+};
+
 async function sendReply() {
   const status = document.getElementById("replyStatus");
   const btn = document.getElementById("sendReply");
@@ -294,6 +324,8 @@ async function sendReply() {
   status.className = "";
   if (!CURRENT || !PW) { status.textContent = "請重新整理再入密碼。"; status.className = "err"; return; }
   const to = document.getElementById("rTo").value.trim();
+  const cc = document.getElementById("rAll").checked
+    ? document.getElementById("rCc").value.trim() : "";
   const subject = document.getElementById("rSubj").value.trim();
   const text = document.getElementById("rBody").value.trim();
   if (!to || !subject || !text) { status.textContent = "收件人、主旨同內容唔可以留空。"; status.className = "err"; return; }
@@ -306,7 +338,7 @@ async function sendReply() {
     const res = await fetch(REPLY_API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ viewKey: PW, to, subject, body,
+      body: JSON.stringify({ viewKey: PW, to, cc, subject, body,
         inReplyTo: CURRENT.message_id || "", references }),
     });
     const data = await res.json().catch(() => ({}));
