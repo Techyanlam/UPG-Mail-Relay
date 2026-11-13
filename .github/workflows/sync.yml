@@ -1,0 +1,36 @@
+name: Sync UPG public mailbox
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install cryptography
+      - name: Sync mailbox
+        env:
+          IMAP_HOST: imap.feishu.cn
+          IMAP_PORT: "993"
+          IMAP_USER: Ida.Sze@upg.com.hk
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          MAIL_VIEW_KEY: ${{ secrets.MAIL_VIEW_KEY }}
+          MAX_MESSAGES: "100"
+        run: python scripts/sync_mail.py
+      - name: Commit encrypted snapshot
+        run: |
+          git config user.name "mail-relay-bot"
+          git config user.email "mail-relay-bot@users.noreply.github.com"
+          git add mail.enc.json
+          git diff --cached --quiet || git commit -m "Sync mailbox snapshot"
+          git push
