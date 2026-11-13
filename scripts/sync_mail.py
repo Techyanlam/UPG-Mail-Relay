@@ -9,8 +9,15 @@ Secrets come only from the environment (GitHub Actions secrets):
   IMAP_PASSWORD  the public mailbox IMAP/SMTP password (reset in Lark Admin)
   MAIL_VIEW_KEY  passphrase the viewer types in to decrypt the snapshot
   MAX_MESSAGES   default 100 (newest first)
+  MAX_FETCH_BYTES default 2000000 (messages bigger than this: headers only)
 
 Nothing secret is printed. Only a count is logged.
+
+Resilience notes: the Feishu IMAP server sometimes closes the connection
+mid-fetch (``socket error: EOF``), usually on a very large message. So we
+check RFC822.SIZE first, fetch big messages as headers-only, and retry
+each normal fetch on a fresh connection instead of letting one bad
+message abort the whole sync.
 """
 import base64
 import email
@@ -109,6 +116,75 @@ def body_text(msg):
     return "", attachments
 
 
+def parse_msg(raw, uid):
+    msg = email.message_from_bytes(raw)
+    try:
+        dt = parsedate_to_datetime(msg.get("Date") or "")
+        date_iso = dt.astimezone(timezone.utc).isoformat() if dt else ""
+    except Exception:
+        date_iso = ""
+    text, attachments = body_text(msg)
+    return {
+        "uid": uid,
+        "date": date_iso,
+        "from": decode_str(msg.get("From")),
+        "to": decode_str(msg.get("To")),
+        "subject": decode_str(msg.get("Subject")),
+        "attachments": attachments,
+        "body": text[:MAX_BODY],
+    }
+
+
+def parse_header(raw, uid, note=""):
+    msg = email.message_from_bytes(raw)
+    try:
+        dt = parsedate_to_datetime(msg.get("Date") or "")
+        date_iso = dt.astimezone(timezone.utc).isoformat() if dt else ""
+    except Exception:
+        date_iso = ""
+    return {
+        "uid": uid,
+        "date": date_iso,
+        "from": decode_str(msg.get("From")),
+        "to": decode_str(msg.get("To")),
+        "subject": decode_str(msg.get("Subject")),
+        "attachments": [],
+        "body": note,
+    }
+
+
+def connect(host, port, user, password):
+    mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
+    try:
+        mail.sock.settimeout(120)
+    except Exception:
+        pass
+    mail.login(user, password)
+    mail.select("INBOX")
+    return mail
+
+
+def close(mail):
+    try:
+        mail.close()
+    except Exception:
+        pass
+    try:
+        mail.logout()
+    except Exception:
+        pass
+
+
+def fetch_raw(mail, uid, what):
+    status, data = mail.fetch(uid, what)
+    if status != "OK" or not data:
+        raise imaplib.IMAP4.error(f"fetch {what} failed for {uid}")
+    for item in data:
+        if isinstance(item, tuple) and isinstance(item[1], bytes):
+            return item[1]
+    raise imaplib.IMAP4.error(f"fetch {what} returned no bytes for {uid}")
+
+
 def main():
     host = os.environ.get("IMAP_HOST", "imap.feishu.cn")
     port = int(os.environ.get("IMAP_PORT", "993"))
@@ -116,51 +192,92 @@ def main():
     password = os.environ.get("IMAP_PASSWORD", "")
     view_key = os.environ.get("MAIL_VIEW_KEY", "")
     max_messages = int(os.environ.get("MAX_MESSAGES", "100"))
+    max_fetch = int(os.environ.get("MAX_FETCH_BYTES", "2000000"))
     if not password or not view_key:
         print("IMAP_PASSWORD and MAIL_VIEW_KEY are required", file=sys.stderr)
         return 2
 
-    mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
+    mail = connect(host, port, user, password)
     try:
-        mail.login(user, password)
-        mail.select("INBOX")
         status, data = mail.search(None, "ALL")
         if status != "OK":
             print("IMAP search failed", file=sys.stderr)
             return 1
-        uids = data[0].split()
+        uids = [u.decode("ascii") for u in data[0].split()]
         uids = uids[-max_messages:]
-        messages = []
-        for uid in reversed(uids):  # newest first
-            status, data = mail.fetch(uid, "(RFC822)")
-            if status != "OK" or not data or not data[0]:
-                continue
-            raw = data[0][1]
-            if isinstance(raw, tuple):
-                raw = raw[1]
-            msg = email.message_from_bytes(raw)
+
+        # Size check first, in one small call, so a huge message never
+        # gets a full fetch that kills the connection.
+        sizes = {}
+        if uids:
             try:
-                dt = parsedate_to_datetime(msg.get("Date") or "")
-                date_iso = dt.astimezone(timezone.utc).isoformat() if dt else ""
-            except Exception:
-                date_iso = ""
-            text, attachments = body_text(msg)
-            messages.append(
-                {
-                    "uid": uid.decode("ascii", errors="replace"),
-                    "date": date_iso,
-                    "from": decode_str(msg.get("From")),
-                    "to": decode_str(msg.get("To")),
-                    "subject": decode_str(msg.get("Subject")),
-                    "attachments": attachments,
-                    "body": text[:MAX_BODY],
-                }
-            )
+                status, data = mail.fetch(",".join(uids), "(UID RFC822.SIZE)")
+                if status == "OK":
+                    blob = b" ".join(
+                        item[0] if isinstance(item, tuple) else b""
+                        for item in data
+                        if item
+                    ).decode("ascii", errors="replace")
+                    for m in re.finditer(r"UID (\d+) RFC822\.SIZE (\d+)", blob):
+                        sizes[m.group(1)] = int(m.group(2))
+            except Exception as e:
+                print(f"size check failed, continuing without it: {e}")
     finally:
-        try:
-            mail.logout()
-        except Exception:
-            pass
+        close(mail)
+
+    messages = []
+    skipped = 0
+    for uid in reversed(uids):  # newest first
+        size = sizes.get(uid, 0)
+        big = size > max_fetch
+        record = None
+        # Fresh connection per message: if the server drops us mid-fetch,
+        # only this message is affected, never the whole sync.
+        for attempt in range(3):
+            mail = None
+            try:
+                mail = connect(host, port, user, password)
+                if big:
+                    raw = fetch_raw(mail, uid, "(BODY.PEEK[HEADER])")
+                    record = parse_header(
+                        raw, uid, "（呢封信附件較大，未同步內文，請喺 Lark 睇原文。）"
+                    )
+                else:
+                    raw = fetch_raw(mail, uid, "(RFC822)")
+                    record = parse_msg(raw, uid)
+                break
+            except Exception as e:
+                print(f"uid {uid} attempt {attempt + 1} failed: {type(e).__name__}")
+                record = None
+                if attempt == 2:
+                    # Last resort: header only, so the message still shows
+                    # in the list instead of killing the sync.
+                    try:
+                        mail2 = connect(host, port, user, password)
+                        try:
+                            raw = fetch_raw(mail2, uid, "(BODY.PEEK[HEADER])")
+                            record = parse_header(
+                                raw, uid, "（呢封信同步時連線中斷，未同步內文。）"
+                            )
+                        finally:
+                            close(mail2)
+                    except Exception:
+                        record = {
+                            "uid": uid,
+                            "date": "",
+                            "from": "",
+                            "to": "",
+                            "subject": "（未能同步此封信）",
+                            "attachments": [],
+                            "body": "",
+                        }
+            finally:
+                if mail is not None:
+                    close(mail)
+        if record is None:
+            skipped += 1
+            continue
+        messages.append(record)
 
     payload = {
         "mailbox": user,
@@ -194,7 +311,7 @@ def main():
     out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mail.enc.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f)
-    print(f"synced {len(messages)} messages -> mail.enc.json")
+    print(f"synced {len(messages)} messages ({skipped} skipped) -> mail.enc.json")
     return 0
 
 
