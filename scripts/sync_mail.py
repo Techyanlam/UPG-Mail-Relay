@@ -281,6 +281,37 @@ def close(mail):
         pass
 
 
+def extract_uid(header):
+    """UID of a message from a FETCH response header.
+
+    UID FETCH replies look like ``12 FETCH (UID 1947 RFC822 {123}`` (the
+    leading number is the sequence number, the UID is the ``UID`` attribute).
+    Some servers instead put the UID up front, so fall back to that."""
+    m = re.search(rb"UID (\d+)", header)
+    if m:
+        return m.group(1).decode("ascii")
+    m = re.match(rb"(\d+) \(", header)
+    if m:
+        return m.group(1).decode("ascii")
+    return None
+
+
+def parse_batch_fetch(data, chunk):
+    """Parse one UID FETCH response into {uid: raw_bytes}.
+
+    Returns None if the UIDs do not line up exactly with the chunk that
+    was requested (then the caller falls back to one-by-one fetching)."""
+    got = {}
+    for item in data:
+        if isinstance(item, tuple) and isinstance(item[1], bytes):
+            uid = extract_uid(item[0])
+            if uid is not None:
+                got[uid] = item[1]
+    if set(got.keys()) != set(chunk):
+        return None
+    return got
+
+
 def uid_fetch_raw(mail, uid, what):
     status, data = mail.uid("fetch", uid, what)
     if status != "OK" or not data:
@@ -397,15 +428,9 @@ def sync_folder(host, port, user, password, folder, max_messages, max_fetch, pre
                     try:
                         status, data = mail.uid("fetch", ",".join(chunk), "(RFC822)")
                         if status == "OK" and data:
-                            got = {}
-                            for item in data:
-                                if isinstance(item, tuple) and isinstance(item[1], bytes):
-                                    m = re.search(rb"(\d+) \(RFC822", item[0])
-                                    if m:
-                                        got[m.group(1).decode("ascii")] = item[1]
-                            if len(got) != len(chunk):
-                                print(f"[{folder}] chunk fetch returned {len(got)}/{len(chunk)}, falling back")
-                                got = None
+                            got = parse_batch_fetch(data, chunk)
+                            if got is None:
+                                print(f"[{folder}] chunk fetch UID mismatch, falling back")
                     except Exception as e:
                         print(f"[{folder}] chunk fetch failed ({type(e).__name__}), falling back")
                         got = None
