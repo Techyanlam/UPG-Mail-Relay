@@ -372,37 +372,63 @@ def sync_folder(host, port, user, password, folder, max_messages, max_fetch, pre
         else:
             to_fetch.append((uid, size))
 
-    # Batch-fetch all new small messages in one call; fall back to
-    # one-by-one if the server drops the connection mid-batch.
+    # Fetch new messages in small batches (10 per call) over one shared
+    # connection. A single 100-message fetch gets cut off by the server
+    # (socket EOF), and fetching one-by-one with a fresh login each time
+    # takes minutes; 10-at-a-time is the middle ground. A failed chunk
+    # falls back to one-by-one for that chunk only.
     if to_fetch:
-        batch_ok = False
-        mail = None
+        size_map = dict(to_fetch)
+        chunk_size = 10
         try:
             mail = connect(host, port, user, password, folder)
-            uid_set = ",".join(uid for uid, _ in to_fetch)
-            status, data = mail.uid("fetch", uid_set, "(RFC822)")
-            if status == "OK" and data:
-                got = {}
-                for item in data:
-                    if isinstance(item, tuple) and isinstance(item[1], bytes):
-                        m = re.search(rb"(\d+) \(RFC822", item[0])
-                        if m:
-                            got[m.group(1).decode("ascii")] = item[1]
-                if len(got) == len(to_fetch):
-                    size_map = dict(to_fetch)
-                    for uid, _ in to_fetch:
-                        messages.append(parse_msg(got[uid], uid, folder, size_map[uid]))
-                    batch_ok = True
-                else:
-                    print(f"[{folder}] batch fetch returned {len(got)}/{len(to_fetch)}, falling back")
         except Exception as e:
-            print(f"[{folder}] batch fetch failed ({type(e).__name__}), falling back")
-        finally:
-            if mail is not None:
-                close(mail)
-        if not batch_ok:
+            print(f"[{folder}] connect failed ({type(e).__name__}), fetching one-by-one")
+            mail = None
+        if mail is None:
             for uid, size in to_fetch:
                 messages.append(fetch_one(host, port, user, password, folder, uid, size, max_fetch))
+        else:
+            try:
+                i = 0
+                while i < len(to_fetch):
+                    chunk = [uid for uid, _ in to_fetch[i:i + chunk_size]]
+                    got = None
+                    try:
+                        status, data = mail.uid("fetch", ",".join(chunk), "(RFC822)")
+                        if status == "OK" and data:
+                            got = {}
+                            for item in data:
+                                if isinstance(item, tuple) and isinstance(item[1], bytes):
+                                    m = re.search(rb"(\d+) \(RFC822", item[0])
+                                    if m:
+                                        got[m.group(1).decode("ascii")] = item[1]
+                            if len(got) != len(chunk):
+                                print(f"[{folder}] chunk fetch returned {len(got)}/{len(chunk)}, falling back")
+                                got = None
+                    except Exception as e:
+                        print(f"[{folder}] chunk fetch failed ({type(e).__name__}), falling back")
+                        got = None
+                        close(mail)
+                        mail = None
+                    if got is not None:
+                        for uid in chunk:
+                            messages.append(parse_msg(got[uid], uid, folder, size_map[uid]))
+                    else:
+                        for uid in chunk:
+                            messages.append(fetch_one(host, port, user, password, folder, uid, size_map[uid], max_fetch))
+                    i += chunk_size
+                    if mail is None and i < len(to_fetch):
+                        try:
+                            mail = connect(host, port, user, password, folder)
+                        except Exception as e:
+                            print(f"[{folder}] reconnect failed ({type(e).__name__}), remaining one-by-one")
+                            for uid, size in to_fetch[i:]:
+                                messages.append(fetch_one(host, port, user, password, folder, uid, size, max_fetch))
+                            break
+            finally:
+                if mail is not None:
+                    close(mail)
 
     return messages, skipped
 
