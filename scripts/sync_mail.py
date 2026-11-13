@@ -8,10 +8,11 @@ Secrets come only from the environment (GitHub Actions secrets):
   IMAP_USER      default Ida.Sze@upg.com.hk
   IMAP_PASSWORD  the public mailbox IMAP/SMTP password (reset in Lark Admin)
   MAIL_VIEW_KEY  passphrase the viewer types in to decrypt the snapshot
-  MAX_MESSAGES   default 100 (newest first)
+  MAX_MESSAGES   default 100 (newest first, INBOX)
+  MAX_SENT       default 20 (newest first, Sent folder, if found)
   MAX_FETCH_BYTES default 2000000 (messages bigger than this: headers only)
 
-Nothing secret is printed. Only a count is logged.
+Nothing secret is printed. Only counts and folder names are logged.
 
 Resilience notes: the Feishu IMAP server sometimes closes the connection
 mid-fetch (``socket error: EOF``), usually on a very large message. So we
@@ -116,7 +117,15 @@ def body_text(msg):
     return "", attachments
 
 
-def parse_msg(raw, uid):
+def thread_fields(msg):
+    return {
+        "message_id": (msg.get("Message-ID") or "").strip(),
+        "in_reply_to": (msg.get("In-Reply-To") or "").strip(),
+        "references": (msg.get("References") or "").strip(),
+    }
+
+
+def parse_msg(raw, uid, folder):
     msg = email.message_from_bytes(raw)
     try:
         dt = parsedate_to_datetime(msg.get("Date") or "")
@@ -124,8 +133,9 @@ def parse_msg(raw, uid):
     except Exception:
         date_iso = ""
     text, attachments = body_text(msg)
-    return {
+    rec = {
         "uid": uid,
+        "folder": folder,
         "date": date_iso,
         "from": decode_str(msg.get("From")),
         "to": decode_str(msg.get("To")),
@@ -133,17 +143,20 @@ def parse_msg(raw, uid):
         "attachments": attachments,
         "body": text[:MAX_BODY],
     }
+    rec.update(thread_fields(msg))
+    return rec
 
 
-def parse_header(raw, uid, note=""):
+def parse_header(raw, uid, folder, note=""):
     msg = email.message_from_bytes(raw)
     try:
         dt = parsedate_to_datetime(msg.get("Date") or "")
         date_iso = dt.astimezone(timezone.utc).isoformat() if dt else ""
     except Exception:
         date_iso = ""
-    return {
+    rec = {
         "uid": uid,
+        "folder": folder,
         "date": date_iso,
         "from": decode_str(msg.get("From")),
         "to": decode_str(msg.get("To")),
@@ -151,16 +164,18 @@ def parse_header(raw, uid, note=""):
         "attachments": [],
         "body": note,
     }
+    rec.update(thread_fields(msg))
+    return rec
 
 
-def connect(host, port, user, password):
+def connect(host, port, user, password, folder="INBOX"):
     mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
     try:
         mail.sock.settimeout(120)
     except Exception:
         pass
     mail.login(user, password)
-    mail.select("INBOX")
+    mail.select(folder)
     return mail
 
 
@@ -185,24 +200,14 @@ def fetch_raw(mail, uid, what):
     raise imaplib.IMAP4.error(f"fetch {what} returned no bytes for {uid}")
 
 
-def main():
-    host = os.environ.get("IMAP_HOST", "imap.feishu.cn")
-    port = int(os.environ.get("IMAP_PORT", "993"))
-    user = os.environ.get("IMAP_USER", "Ida.Sze@upg.com.hk")
-    password = os.environ.get("IMAP_PASSWORD", "")
-    view_key = os.environ.get("MAIL_VIEW_KEY", "")
-    max_messages = int(os.environ.get("MAX_MESSAGES", "100"))
-    max_fetch = int(os.environ.get("MAX_FETCH_BYTES", "2000000"))
-    if not password or not view_key:
-        print("IMAP_PASSWORD and MAIL_VIEW_KEY are required", file=sys.stderr)
-        return 2
-
-    mail = connect(host, port, user, password)
+def sync_folder(host, port, user, password, folder, max_messages, max_fetch):
+    """Fetch the newest messages from one folder. Returns (records, skipped)."""
+    mail = connect(host, port, user, password, folder)
     try:
         status, data = mail.search(None, "ALL")
         if status != "OK":
-            print("IMAP search failed", file=sys.stderr)
-            return 1
+            print(f"[{folder}] IMAP search failed", file=sys.stderr)
+            return [], 0
         uids = [u.decode("ascii") for u in data[0].split()]
         uids = uids[-max_messages:]
 
@@ -223,7 +228,7 @@ def main():
                     for m in re.finditer(r"UID (\d+) RFC822\.SIZE (\d+)", blob):
                         sizes[m.group(1)] = int(m.group(2))
             except Exception as e:
-                print(f"size check failed, continuing without it: {e}")
+                print(f"[{folder}] size check failed, continuing without it: {e}")
     finally:
         close(mail)
 
@@ -238,40 +243,44 @@ def main():
         for attempt in range(3):
             mail = None
             try:
-                mail = connect(host, port, user, password)
+                mail = connect(host, port, user, password, folder)
                 if big:
                     raw = fetch_raw(mail, uid, "(BODY.PEEK[HEADER])")
                     record = parse_header(
-                        raw, uid, "（呢封信附件較大，未同步內文，請喺 Lark 睇原文。）"
+                        raw, uid, folder, "（呢封信附件較大，未同步內文，請喺 Lark 睇原文。）"
                     )
                 else:
                     raw = fetch_raw(mail, uid, "(RFC822)")
-                    record = parse_msg(raw, uid)
+                    record = parse_msg(raw, uid, folder)
                 break
             except Exception as e:
-                print(f"uid {uid} attempt {attempt + 1} failed: {type(e).__name__}")
+                print(f"[{folder}] uid {uid} attempt {attempt + 1} failed: {type(e).__name__}")
                 record = None
                 if attempt == 2:
                     # Last resort: header only, so the message still shows
                     # in the list instead of killing the sync.
                     try:
-                        mail2 = connect(host, port, user, password)
+                        mail2 = connect(host, port, user, password, folder)
                         try:
                             raw = fetch_raw(mail2, uid, "(BODY.PEEK[HEADER])")
                             record = parse_header(
-                                raw, uid, "（呢封信同步時連線中斷，未同步內文。）"
+                                raw, uid, folder, "（呢封信同步時連線中斷，未同步內文。）"
                             )
                         finally:
                             close(mail2)
                     except Exception:
                         record = {
                             "uid": uid,
+                            "folder": folder,
                             "date": "",
                             "from": "",
                             "to": "",
                             "subject": "（未能同步此封信）",
                             "attachments": [],
                             "body": "",
+                            "message_id": "",
+                            "in_reply_to": "",
+                            "references": "",
                         }
             finally:
                 if mail is not None:
@@ -280,6 +289,70 @@ def main():
             skipped += 1
             continue
         messages.append(record)
+    return messages, skipped
+
+
+def find_sent_folder(host, port, user, password):
+    """List folders (names only, logged) and return a Sent-like folder or None."""
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
+        mail.login(user, password)
+        status, data = mail.list()
+        names = []
+        if status == "OK" and data:
+            for item in data:
+                raw = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
+                m = re.search(r'"([^"]+)"\s*$', raw.strip())
+                names.append(m.group(1) if m else raw.strip())
+        print("folders: " + ", ".join(names))
+        for cand in ("Sent", "Sent Items", "INBOX.Sent", "Sent Messages"):
+            if cand in names:
+                return cand
+        for n in names:
+            low = n.lower()
+            if "sent" in low or "已發" in low or "寄件" in low:
+                return n
+        return None
+    except Exception as e:
+        print(f"folder list failed: {type(e).__name__}")
+        return None
+    finally:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+def main():
+    host = os.environ.get("IMAP_HOST", "imap.feishu.cn")
+    port = int(os.environ.get("IMAP_PORT", "993"))
+    user = os.environ.get("IMAP_USER", "Ida.Sze@upg.com.hk")
+    password = os.environ.get("IMAP_PASSWORD", "")
+    view_key = os.environ.get("MAIL_VIEW_KEY", "")
+    max_messages = int(os.environ.get("MAX_MESSAGES", "100"))
+    max_sent = int(os.environ.get("MAX_SENT", "20"))
+    max_fetch = int(os.environ.get("MAX_FETCH_BYTES", "2000000"))
+    if not password or not view_key:
+        print("IMAP_PASSWORD and MAIL_VIEW_KEY are required", file=sys.stderr)
+        return 2
+
+    inbox, skipped_inbox = sync_folder(host, port, user, password, "INBOX", max_messages, max_fetch)
+    messages = inbox
+    skipped = skipped_inbox
+
+    sent_folder = find_sent_folder(host, port, user, password)
+    if sent_folder:
+        sent, skipped_sent = sync_folder(host, port, user, password, sent_folder, max_sent, max_fetch)
+        messages = messages + sent
+        skipped += skipped_sent
+        print(f"synced Sent folder '{sent_folder}': {len(sent)} messages")
+    else:
+        print("no Sent folder found, skipping sent sync")
+
+    # Newest first overall for the viewer list.
+    messages.sort(key=lambda m: m.get("date") or "", reverse=True)
 
     payload = {
         "mailbox": user,
