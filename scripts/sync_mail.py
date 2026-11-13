@@ -79,8 +79,21 @@ def decode_str(raw):
     return _ENCODED_WORD.sub(_decode_encoded_word, "".join(out))
 
 
+def clean_html(html):
+    """Strip active content from an HTML mail body before it is stored.
+    The viewer renders it inside a sandboxed iframe (no scripts), but
+    defence in depth: drop script/iframe/object/form tags, event-handler
+    attributes and javascript: URLs here too."""
+    html = re.sub(r"(?is)<(script|iframe|object|embed|form|link|meta|base|title)[^>]*>.*?</\1>", "", html)
+    html = re.sub(r"(?is)<(script|iframe|object|embed|form|link|meta|base|title)[^>]*/?>", "", html)
+    html = re.sub(r"(?is)\son\w+\s*=", " data-x=", html)
+    html = re.sub(r"(?is)javascript\s*:", "", html)
+    return html
+
+
 def body_text(msg):
-    """Prefer text/plain; fall back to stripped HTML."""
+    """Prefer text/plain; fall back to stripped HTML.
+    Also returns the cleaned raw HTML (for table layout) when present."""
     text_parts = []
     html_parts = []
     attachments = []
@@ -122,17 +135,17 @@ def body_text(msg):
             else:
                 text_parts.append(text)
     if text_parts:
-        return "\n".join(text_parts).strip(), attachments
+        return "\n".join(text_parts).strip(), attachments, clean_html("\n".join(html_parts))
     if html_parts:
         html = "\n".join(html_parts)
-        html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
-        html = re.sub(r"(?is)<br\s*/?>", "\n", html)
-        html = re.sub(r"(?is)</(p|div|tr|li|h\d)>", "\n", html)
-        html = re.sub(r"(?is)<[^>]+>", "", html)
+        text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+        text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?is)</(p|div|tr|li|h\d)>", "\n", text)
+        text = re.sub(r"(?is)<[^>]+>", "", text)
         import html as htmlmod
 
-        return htmlmod.unescape(html).strip(), attachments
-    return "", attachments
+        return htmlmod.unescape(text).strip(), attachments, clean_html(html)
+    return "", attachments, ""
 
 
 def thread_fields(msg):
@@ -150,7 +163,7 @@ def parse_msg(raw, uid, folder):
         date_iso = dt.astimezone(timezone.utc).isoformat() if dt else ""
     except Exception:
         date_iso = ""
-    text, attachments = body_text(msg)
+    text, attachments, html = body_text(msg)
     rec = {
         "uid": uid,
         "folder": folder,
@@ -160,6 +173,7 @@ def parse_msg(raw, uid, folder):
         "subject": decode_str(msg.get("Subject")),
         "attachments": attachments,
         "body": text[:MAX_BODY],
+        "body_html": html[:150000],
     }
     rec.update(thread_fields(msg))
     return rec
@@ -181,6 +195,7 @@ def parse_header(raw, uid, folder, note=""):
         "subject": decode_str(msg.get("Subject")),
         "attachments": [],
         "body": note,
+        "body_html": "",
     }
     rec.update(thread_fields(msg))
     return rec
@@ -296,6 +311,7 @@ def sync_folder(host, port, user, password, folder, max_messages, max_fetch):
                             "subject": "（未能同步此封信）",
                             "attachments": [],
                             "body": "",
+                            "body_html": "",
                             "message_id": "",
                             "in_reply_to": "",
                             "references": "",
