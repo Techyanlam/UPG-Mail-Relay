@@ -24,6 +24,7 @@ import base64
 import email
 import json
 import os
+import quopri
 import re
 import ssl
 import sys
@@ -40,11 +41,28 @@ def b64(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
 
+_ENCODED_WORD = re.compile(r"=\?([^?\s]+)\?([bBqQ])\?([^?]*)\?=")
+
+
+def _decode_encoded_word(m):
+    # Fallback for malformed encoded-words that email.decode_header leaves
+    # untouched (e.g. a raw em-dash inside the payload, as some senders emit).
+    charset, enc, text = m.group(1), m.group(2).lower(), m.group(3)
+    try:
+        if enc == "b":
+            raw = base64.b64decode(text)
+        else:
+            raw = quopri.decodestring(text.replace("_", " ").encode("utf-8", errors="replace"))
+        return raw.decode(charset, errors="replace")
+    except Exception:
+        return m.group(0)
+
+
 def decode_str(raw):
     if raw is None:
         return ""
     if isinstance(raw, str):
-        return raw
+        return _ENCODED_WORD.sub(_decode_encoded_word, raw)
     try:
         parts = decode_header(raw)
     except Exception:
@@ -58,7 +76,7 @@ def decode_str(raw):
                 out.append(text.decode("utf-8", errors="replace"))
         else:
             out.append(text)
-    return "".join(out)
+    return _ENCODED_WORD.sub(_decode_encoded_word, "".join(out))
 
 
 def body_text(msg):
