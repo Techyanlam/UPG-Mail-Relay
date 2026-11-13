@@ -107,6 +107,7 @@
       <h3 id="dSubj"></h3>
       <p class="meta" id="dMeta"></p>
       <div id="detail"></div>
+      <iframe id="htmlFrame" class="hidden" sandbox="allow-same-origin" style="width:100%;border:1px solid #eee;border-radius:8px;background:#fff;"></iframe>
       <div id="replyBox">
         <h4>回覆（以 Ida.Sze@upg.com.hk 寄出）</h4>
         <label>收件人</label>
@@ -245,9 +246,27 @@ function openMail(m, li) {
   if (li) li.classList.add("selected");
   document.getElementById("emptyMsg").classList.add("hidden");
   document.getElementById("dSubj").textContent = m.subject || "(冇主旨)";
-  document.getElementById("dMeta").textContent = "寄件人：" + (m.from || "") + "　時間：" + fmtDate(m.date) +
+  document.getElementById("dMeta").textContent = "寄件人：" + (m.from || "") +
+    (m.to ? "　收件人：" + m.to : "") + "　時間：" + fmtDate(m.date) +
     (m.attachments && m.attachments.length ? "　附件：" + m.attachments.join("、") : "");
-  document.getElementById("detail").textContent = m.body || "(冇內文)";
+  const frame = document.getElementById("htmlFrame");
+  const detail = document.getElementById("detail");
+  if (m.body_html) {
+    detail.classList.add("hidden");
+    frame.classList.remove("hidden");
+    frame.style.height = "600px";
+    frame.onload = () => {
+      try {
+        const h = frame.contentDocument.documentElement.scrollHeight;
+        frame.style.height = Math.min(Math.max(h + 20, 200), 4000) + "px";
+      } catch (e) { frame.style.height = "600px"; }
+    };
+    frame.srcdoc = m.body_html;
+  } else {
+    frame.classList.add("hidden");
+    detail.classList.remove("hidden");
+    detail.textContent = m.body || "(冇內文)";
+  }
   const sent = isSent(m);
   document.getElementById("replyBox").classList.toggle("hidden", sent);
   if (!sent) {
