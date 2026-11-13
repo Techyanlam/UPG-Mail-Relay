@@ -213,11 +213,13 @@ def main():
             try:
                 status, data = mail.fetch(",".join(uids), "(UID RFC822.SIZE)")
                 if status == "OK":
-                    blob = b" ".join(
-                        item[0] if isinstance(item, tuple) else b""
-                        for item in data
-                        if item
-                    ).decode("ascii", errors="replace")
+                    parts = []
+                    for item in data:
+                        if isinstance(item, tuple):
+                            parts.append(item[0])
+                        elif isinstance(item, bytes):
+                            parts.append(item)
+                    blob = b" ".join(parts).decode("ascii", errors="replace")
                     for m in re.finditer(r"UID (\d+) RFC822\.SIZE (\d+)", blob):
                         sizes[m.group(1)] = int(m.group(2))
             except Exception as e:
