@@ -23,13 +23,21 @@
   #list .from { color: #444; font-size: 14px; }
   #list .date { color: #888; font-size: 12px; }
   #detail { white-space: pre-wrap; word-break: break-word; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 14px; margin-top: 12px; font-size: 14px; line-height: 1.6; }
+  #replyBox { margin-top: 16px; border-top: 1px solid #eee; padding-top: 12px; }
+  #replyBox textarea { width: 100%; box-sizing: border-box; min-height: 140px; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; font-family: inherit; }
+  #replyBox input[type=text] { margin-bottom: 8px; }
+  #replyBox label { display: block; font-size: 13px; color: #666; margin: 8px 0 4px; }
+  #replyStatus { margin-top: 10px; font-size: 14px; }
+  #replyStatus.ok { color: #0a7a2f; }
+  #replyStatus.err { color: #b00020; }
+  .tag { display: inline-block; font-size: 11px; color: #1f3a5f; background: #e8eef5; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
   .hidden { display: none; }
 </style>
 </head>
 <body>
 <header>
   <h1>UPG 公共郵箱</h1>
-  <p>Ida.Sze@upg.com.hk（唯讀中轉）</p>
+  <p>Ida.Sze@upg.com.hk（收信 + 回覆）</p>
 </header>
 <main>
   <div id="gate">
@@ -37,7 +45,7 @@
     <input id="pw" type="password" placeholder="閱覽密碼" autocomplete="off">
     <br><button id="unlock">開信箱</button>
     <p class="err hidden" id="gateErr"></p>
-    <p class="meta">密碼只會喺你部機上面用嚟解密，唔會傳送去任何地方。</p>
+    <p class="meta">密碼只會喺你部機上面用嚟解密；回覆嗰陣會傳去 Cloudflare Worker 驗證身份，唔會存起。</p>
   </div>
 
   <div id="app" class="hidden">
@@ -49,13 +57,27 @@
       <h3 id="dSubj"></h3>
       <p class="meta" id="dMeta"></p>
       <div id="detail"></div>
+      <div id="replyBox">
+        <h4>回覆（以 Ida.Sze@upg.com.hk 寄出）</h4>
+        <label>收件人</label>
+        <input id="rTo" type="text" readonly>
+        <label>主旨</label>
+        <input id="rSubj" type="text">
+        <label>回覆內容</label>
+        <textarea id="rBody" placeholder="打回覆內容…"></textarea>
+        <br><button id="sendReply">寄出回覆</button>
+        <p id="replyStatus"></p>
+      </div>
     </div>
     <button class="secondary" id="refresh">重新整理</button>
   </div>
 </main>
 <script>
+const REPLY_API = "https://upg-mail-relay-send.yan-lam.workers.dev/send";
 let MESSAGES = [];
 let KEY = null;
+let PW = null;
+let CURRENT = null;
 
 function b64ToBuf(b64) {
   const bin = atob(b64);
@@ -85,6 +107,7 @@ async function unlock() {
     const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, KEY, data);
     const payload = JSON.parse(new TextDecoder().decode(plain));
     MESSAGES = payload.messages || [];
+    PW = pw;
     document.getElementById("syncInfo").textContent =
       "共 " + payload.count + " 封（最新 " + MESSAGES.length + " 封）・最後同步：" + fmtDate(payload.synced_at);
     document.getElementById("gate").classList.add("hidden");
@@ -106,21 +129,82 @@ function renderList(q) {
   shown.forEach(m => {
     const li = document.createElement("li");
     const subj = document.createElement("div"); subj.className = "subj"; subj.textContent = m.subject || "(冇主旨)";
+    if (m.folder && m.folder !== "INBOX") {
+      const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = "寄件";
+      subj.appendChild(tag);
+    }
     const from = document.createElement("div"); from.className = "from"; from.textContent = m.from || "";
     const date = document.createElement("div"); date.className = "date"; date.textContent = fmtDate(m.date);
     li.append(subj, from, date);
     li.onclick = () => {
+      CURRENT = m;
       document.getElementById("dSubj").textContent = m.subject || "(冇主旨)";
       document.getElementById("dMeta").textContent = "寄件人：" + (m.from || "") + "　時間：" + fmtDate(m.date) +
         (m.attachments && m.attachments.length ? "　附件：" + m.attachments.join("、") : "");
       document.getElementById("detail").textContent = m.body || "(冇內文)";
+      const isSent = m.folder && m.folder !== "INBOX";
+      document.getElementById("replyBox").classList.toggle("hidden", !!isSent);
+      if (!isSent) {
+        document.getElementById("rTo").value = extractEmail(m.from);
+        document.getElementById("rSubj").value = /^re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
+        document.getElementById("rBody").value = "";
+        document.getElementById("replyStatus").textContent = "";
+        document.getElementById("replyStatus").className = "";
+      }
       document.getElementById("detailWrap").classList.remove("hidden");
       document.getElementById("detailWrap").scrollIntoView();
     };
     list.appendChild(li);
   });
 }
-document.getElementById("unlock").onclick = unlock;
+function extractEmail(from) {
+  if (!from) return "";
+  const m = from.match(/<([^<>]+)>/);
+  if (m) return m[1].trim();
+  const bare = from.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+  return bare ? bare[0] : from.trim();
+}
+async function sendReply() {
+  const status = document.getElementById("replyStatus");
+  const btn = document.getElementById("sendReply");
+  status.textContent = "";
+  status.className = "";
+  if (!CURRENT || !PW) { status.textContent = "請重新整理再入密碼。"; status.className = "err"; return; }
+  const to = document.getElementById("rTo").value.trim();
+  const subject = document.getElementById("rSubj").value.trim();
+  const text = document.getElementById("rBody").value.trim();
+  if (!to || !subject || !text) { status.textContent = "收件人、主旨同內容唔可以留空。"; status.className = "err"; return; }
+  const quoted = (CURRENT.body || "").split("\n").map(l => "> " + l).join("\n");
+  const body = text + "\n\n--- 原文 ---\n" + quoted;
+  const references = [CURRENT.references, CURRENT.message_id].filter(Boolean).join(" ").trim();
+  btn.disabled = true;
+  status.textContent = "寄緊…";
+  try {
+    const res = await fetch(REPLY_API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ viewKey: PW, to, subject, body,
+        inReplyTo: CURRENT.message_id || "", references }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      status.textContent = "已寄出。";
+      status.className = "ok";
+      document.getElementById("rBody").value = "";
+    } else if (data.error === "bad_view_key") {
+      status.textContent = "密碼唔啱，請重新整理再入密碼。";
+      status.className = "err";
+    } else {
+      status.textContent = "寄唔出：" + (data.detail || data.error || res.status);
+      status.className = "err";
+    }
+  } catch (e) {
+    status.textContent = "寄唔出：網絡問題，請再試。";
+    status.className = "err";
+  }
+  btn.disabled = false;
+}
+document.getElementById("sendReply").onclick = sendReply;
 document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") unlock(); });
 document.getElementById("q").addEventListener("input", e => renderList(e.target.value));
 document.getElementById("back").onclick = () => document.getElementById("detailWrap").classList.add("hidden");
